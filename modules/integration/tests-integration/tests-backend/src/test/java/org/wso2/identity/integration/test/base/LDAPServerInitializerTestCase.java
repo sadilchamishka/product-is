@@ -21,6 +21,7 @@ package org.wso2.identity.integration.test.base;
 import org.testng.annotations.AfterSuite;
 import org.testng.annotations.BeforeSuite;
 import org.wso2.identity.integration.common.utils.ISIntegrationTest;
+import org.wso2.identity.integration.test.utils.CommonConstants;
 import org.wso2.identity.integration.test.utils.ExternalLDAPServer;
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.logging.Log;
@@ -36,7 +37,8 @@ public class LDAPServerInitializerTestCase extends ISIntegrationTest {
     private static final Log LOG = LogFactory.getLog(LDAPServerInitializerTestCase.class);
     private static final String workingDirectoryPath = "ldapWorkingDirectory";
     private static final int ldapServerPort = 10389;
-    private static final int offset = 410;
+    // Shares the suite-wide offset so that concurrent shards each get their own LDAP port.
+    private static final int offset = CommonConstants.IS_DEFAULT_OFFSET;
     private ExternalLDAPServer ldapServer;
 
     @BeforeSuite(alwaysRun = true)

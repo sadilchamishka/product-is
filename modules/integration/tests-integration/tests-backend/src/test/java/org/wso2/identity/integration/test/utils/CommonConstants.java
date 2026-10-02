@@ -19,10 +19,24 @@ package org.wso2.identity.integration.test.utils;
 
 public class CommonConstants {
 
-    public static final int IS_DEFAULT_OFFSET = 410;
-    public static final int IS_DEFAULT_HTTPS_PORT = 9853;
-    public static final int DEFAULT_TOMCAT_PORT = 8490;
-    public static final String DEFAULT_SERVICE_URL = "https://localhost:9853/services/";
+    /**
+     * Port offset applied to every server this suite starts. Overridable with -Dport.offset so that several shards of
+     * the suite can run concurrently on one machine without colliding. Defaults to the historical value of 410.
+     */
+    public static final int IS_DEFAULT_OFFSET = Integer.getInteger("port.offset", 410);
+
+    private static final int CARBON_DEFAULT_HTTPS_PORT = 9443;
+    private static final int TOMCAT_BASE_PORT = 8080;
+
+    public static final int IS_DEFAULT_HTTPS_PORT = CARBON_DEFAULT_HTTPS_PORT + IS_DEFAULT_OFFSET;
+
+    /**
+     * Port of the Tomcat instance that hosts the sample applications. Derived from the same offset so that it moves
+     * with the rest of the shard, and separately overridable with -Dtomcat.port.
+     */
+    public static final int DEFAULT_TOMCAT_PORT = Integer.getInteger("tomcat.port", TOMCAT_BASE_PORT + IS_DEFAULT_OFFSET);
+
+    public static final String DEFAULT_SERVICE_URL = "https://localhost:" + IS_DEFAULT_HTTPS_PORT + "/services/";
     public static final String SAML_REQUEST_PARAM = "SAMLRequest";
     public static final String SAML_RESPONSE_PARAM = "SAMLResponse";
     public static final String SESSION_DATA_KEY = "name=\"sessionDataKey\"";
