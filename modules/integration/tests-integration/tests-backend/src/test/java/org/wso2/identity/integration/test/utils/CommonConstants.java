@@ -23,7 +23,17 @@ public class CommonConstants {
      * Port offset applied to every server this suite starts. Overridable with -Dport.offset so that several shards of
      * the suite can run concurrently on one machine without colliding. Defaults to the historical value of 410.
      */
-    public static final int IS_DEFAULT_OFFSET = Integer.getInteger("port.offset", 410);
+    private static final int DEFAULT_OFFSET = 410;
+    private static final int OFFSET_STEP = 10;
+
+    /**
+     * Which shard of the suite this JVM is running. Surefire sets it from ${surefire.forkNumber} under the
+     * parallel-tests profile, so each fork lands on its own ports. Defaults to 1, the single-server case.
+     */
+    private static final int SHARD_NUMBER = Integer.getInteger("shard.number", 1);
+
+    public static final int IS_DEFAULT_OFFSET =
+            Integer.getInteger("port.offset", DEFAULT_OFFSET + (SHARD_NUMBER - 1) * OFFSET_STEP);
 
     private static final int CARBON_DEFAULT_HTTPS_PORT = 9443;
     private static final int TOMCAT_BASE_PORT = 8080;

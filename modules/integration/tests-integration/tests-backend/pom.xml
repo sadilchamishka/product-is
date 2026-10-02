@@ -27,6 +27,16 @@
     <artifactId>org.wso2.carbon.identity.integration.backend.test</artifactId>
     <packaging>jar</packaging>
 
+    <properties>
+        <!-- Defaults below reproduce the single-server behaviour exactly. The parallel-tests profile overrides
+             them so that each Surefire fork runs one shard of the suite against its own Identity Server. -->
+        <integration.test.fork.count>1</integration.test.fork.count>
+        <integration.test.reuse.forks>true</integration.test.reuse.forks>
+        <integration.test.shard.number>1</integration.test.shard.number>
+        <integration.test.resources>${basedir}/src/test/resources/</integration.test.resources>
+        <integration.test.workdir>${basedir}/target</integration.test.workdir>
+    </properties>
+
     <profiles>
         <profile>
             <!--The profile below will activate the profile by default or when the system property "integration" is specified with any value-->
@@ -61,6 +71,8 @@
                                 --add-opens=java.base/java.security.cert=ALL-UNNAMED
                                 --add-opens=java.rmi/sun.rmi.transport=ALL-UNNAMED
                             </argLine>
+                            <forkCount>${integration.test.fork.count}</forkCount>
+                            <reuseForks>${integration.test.reuse.forks}</reuseForks>
                             <suiteXmlFiles>
                                 <!--<suiteXmlFile>src/test/resources/testng-server-mgt.xml</suiteXmlFile>-->
                                 <suiteXmlFile>src/test/resources/testng.xml</suiteXmlFile>
@@ -90,9 +102,11 @@
                                 </property>
                                 <property>
                                     <name>framework.resource.location</name>
-                                    <value>
-                                        ${basedir}/src/test/resources/
-                                    </value>
+                                    <value>${integration.test.resources}</value>
+                                </property>
+                                <property>
+                                    <name>shard.number</name>
+                                    <value>${integration.test.shard.number}</value>
                                 </property>
                                 <property>
                                     <name>server.list</name>
@@ -132,7 +146,7 @@
                                 <AGENTIDENTITY_DATABASE_USERNAME>wso2carbon</AGENTIDENTITY_DATABASE_USERNAME>
                                 <AGENTIDENTITY_DATABASE_PASSWORD>wso2carbon</AGENTIDENTITY_DATABASE_PASSWORD>
                             </environmentVariables>
-                            <workingDirectory>${basedir}/target</workingDirectory>
+                            <workingDirectory>${integration.test.workdir}</workingDirectory>
                         </configuration>
                     </plugin>
                 </plugins>
@@ -209,6 +223,66 @@
                                 </java.util.logging.manager>
                             </systemProperties>
                             <workingDirectory>${basedir}/target</workingDirectory>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+        <profile>
+            <!--
+              Runs the integration suite as four concurrent shards inside a single `mvn clean install`.
+
+              Surefire hands each <suiteXmlFile> to a separate forked JVM, and ${surefire.forkNumber} lets every
+              fork take its own port offset, working directory and automation.xml. Each fork therefore starts its
+              own Identity Server, Tomcat, LDAP and SMTP server and cannot collide with its siblings.
+
+              The shard split is the one the GitHub "Integration Test Runner" workflow uses, and the shard suites
+              are generated from testng.xml on every build, so testng.xml remains the single source of truth.
+
+              Usage:  mvn clean install -Pparallel-tests
+              Needs roughly 4 GB of memory per shard.
+            -->
+            <id>parallel-tests</id>
+            <properties>
+                <integration.test.fork.count>4</integration.test.fork.count>
+                <integration.test.reuse.forks>false</integration.test.reuse.forks>
+                <integration.test.shard.number>${surefire.forkNumber}</integration.test.shard.number>
+                <integration.test.resources>${project.build.directory}/fork-${surefire.forkNumber}/resources/</integration.test.resources>
+                <integration.test.workdir>${project.build.directory}/fork-${surefire.forkNumber}</integration.test.workdir>
+            </properties>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>exec-maven-plugin</artifactId>
+                        <version>3.1.0</version>
+                        <executions>
+                            <execution>
+                                <id>generate-test-shards</id>
+                                <phase>process-test-resources</phase>
+                                <goals><goal>exec</goal></goals>
+                                <configuration>
+                                    <executable>python3</executable>
+                                    <arguments>
+                                        <argument>${basedir}/src/test/scripts/generate-test-shards.py</argument>
+                                        <argument>${basedir}/src/test/resources</argument>
+                                        <argument>${project.build.directory}</argument>
+                                        <argument>${integration.test.fork.count}</argument>
+                                    </arguments>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <artifactId>maven-surefire-plugin</artifactId>
+                        <inherited>false</inherited>
+                        <configuration>
+                            <suiteXmlFiles combine.children="override">
+                                <suiteXmlFile>${project.build.directory}/shards/shard-1.xml</suiteXmlFile>
+                                <suiteXmlFile>${project.build.directory}/shards/shard-2.xml</suiteXmlFile>
+                                <suiteXmlFile>${project.build.directory}/shards/shard-3.xml</suiteXmlFile>
+                                <suiteXmlFile>${project.build.directory}/shards/shard-4.xml</suiteXmlFile>
+                            </suiteXmlFiles>
                         </configuration>
                     </plugin>
                 </plugins>
