@@ -1,0 +1,270 @@
+name: Auto Merge Dependency PRs
+
+# The Dependency Updater opens a pull request here every night. By the time that pull
+# request exists its contents have already been built and tested: the updater runs
+# "mvn clean install" and all 17 integration test suites in the same job, and pushes
+# nothing unless both pass. Only the approve-and-merge has been done by hand.
+#
+# This runs on "pull_request_target" rather than "pull_request" because the dependency
+# pull requests come from the jenkins-is-staging fork, and a "pull_request" run from a
+# fork gets no repository secrets. "pull_request_target" runs this file as it exists on
+# the base branch, with secrets available. Nothing from the pull request is checked out
+# or executed here — the job only calls the GitHub API — so the head branch never gets
+# to run code with this token.
+#
+# The merge goes through the pull request API as an ordinary write, not an
+# administrator override: the pull request is authored by jenkins-is-staging and
+# approved here by wso2-iam-cloud-bot, which are two different accounts, so the review
+# requirement on "master" is satisfied rather than bypassed. Everything else branch
+# protection requires is still enforced by GitHub.
+#
+# Requires IAM_CLOUD_BOT_TOKEN: a token for wso2-iam-cloud-bot with write permission on
+# this repository. Write is enough; this workflow never needs admin.
+
+on:
+  pull_request_target:
+    types: [ opened, reopened, synchronize ]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Number of a dependency bump pull request to merge"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  merge:
+    name: Merge dependency bump PR
+    runs-on: ubuntu-latest
+    # Narrowed to the nightly updater's own pull requests. The "[Next Branch]" stream
+    # that the same account opens against "next" is deliberately left alone — "next" is
+    # a temporary release-time branch and its bumps are reviewed by a person.
+    #
+    # The base branch is checked here as well as in the step below so that a pull
+    # request targeting another branch skips this job quietly rather than starting it
+    # and failing on a refusal that was never going to be actionable.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.user.login == 'jenkins-is-staging' &&
+       startsWith(github.event.pull_request.head.ref, 'IS_dependency_updater_github_action/') &&
+       github.event.pull_request.base.ref == 'master')
+    steps:
+      - name: Merge the dependency bump pull request
+        env:
+          IAM_CLOUD_BOT_TOKEN: ${{ secrets.IAM_CLOUD_BOT_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          # Nothing required is outstanding on these pull requests, so this only has to
+          # cover CodeRabbit and SonarCloud reporting back — minutes, not tens of them.
+          ATTEMPTS: "10"
+          INTERVAL: "60"
+          # Each update spends an attempt, so this is kept well under ATTEMPTS. A base
+          # branch that keeps moving is reported rather than chased.
+          MAX_BRANCH_UPDATES: "2"
+          # Checks that must not be read as a reason to refuse or to keep waiting:
+          #
+          #   Fork Branch Deleter  reports a FAILURE on every one of these pull requests,
+          #                        because the branch it deletes is on a fork it cannot
+          #                        reach. Counting it would refuse all of them.
+          #   license/cla          sits PENDING indefinitely, including after the merge.
+          #                        It is not required by branch protection.
+          #   <this workflow>      reports a check of its own on the pull request it is
+          #                        merging. A cancelled or failed run would otherwise be
+          #                        counted as a failing check by the next run.
+          IGNORED_WORKFLOWS: "Fork Branch Deleter"
+          IGNORED_CHECKS: "license/cla"
+          SELF_WORKFLOW: ${{ github.workflow }}
+        run: |
+          set -euo pipefail
+
+          echo "$IAM_CLOUD_BOT_TOKEN" | gh auth login --with-token
+
+          # Re-checked here rather than trusting the job condition alone, because the
+          # workflow_dispatch path takes a pull request number straight from a person.
+          # Checked explicitly: a failing command substitution inside a here-string does
+          # not trip "set -e", so an API blip would otherwise leave these empty and be
+          # reported below as "opened by , not the dependency updater".
+          if ! identity=$(gh pr view "$PR_NUMBER" --repo "$REPOSITORY" \
+            --json author,headRefName,baseRefName \
+            --jq '[ .author.login, .headRefName, .baseRefName ] | @tsv' 2>&1); then
+            echo "::error::Could not query PR #$PR_NUMBER: $identity"
+            exit 1
+          fi
+
+          read -r author head_ref base_ref <<< "$identity"
+
+          echo "PR #$PR_NUMBER — author=$author head=$head_ref base=$base_ref"
+
+          if [ "$author" != "jenkins-is-staging" ]; then
+            echo "::error::PR #$PR_NUMBER was opened by $author, not the dependency updater. Refusing to merge it."
+            exit 1
+          fi
+
+          case "$head_ref" in
+            IS_dependency_updater_github_action/*) ;;
+            *) echo "::error::PR #$PR_NUMBER is not a dependency bump pull request ($head_ref). Refusing to merge it."; exit 1 ;;
+          esac
+
+          if [ "$base_ref" != "master" ]; then
+            echo "::error::PR #$PR_NUMBER targets $base_ref rather than master. Refusing to merge it."
+            exit 1
+          fi
+
+          # "mvn versions:update-properties" only ever rewrites the root pom. A carbon
+          # kernel bump would also touch modules/p2-profile-gen/carbon.product, so that
+          # is allowed alongside it; anything else in the diff means this is not the
+          # pull request this workflow is meant to merge.
+          if ! changed=$(gh pr view "$PR_NUMBER" --repo "$REPOSITORY" \
+            --json files --jq '[ .files[].path ] | sort | join(",")' 2>&1); then
+            echo "::error::Could not list the files changed by PR #$PR_NUMBER: $changed"
+            exit 1
+          fi
+
+          case "$changed" in
+            "pom.xml"|"modules/p2-profile-gen/carbon.product,pom.xml") ;;
+            *) echo "::error::PR #$PR_NUMBER changes [$changed], not the dependency bump files alone. Refusing to merge it."; exit 1 ;;
+          esac
+
+          # Set up front: every snapshot query in the loop can fail, and the summary
+          # below reads this under "set -u".
+          merge_state="unknown"
+          branch_updates=0
+          approved_here=0
+
+          for attempt in $(seq 1 "$ATTEMPTS"); do
+            # A rate limit or network blip must not end the job: under "set -e" a failing
+            # command substitution in a bare assignment would abort it, so the failure is
+            # captured and the next attempt simply carries on.
+            if ! snapshot=$(gh pr view "$PR_NUMBER" --repo "$REPOSITORY" \
+              --json state,mergeable,reviewDecision,mergeStateStatus,statusCheckRollup 2>&1); then
+              echo "Attempt $attempt: could not query PR #$PR_NUMBER, retrying. Error: $snapshot"
+              sleep "$INTERVAL"
+              continue
+            fi
+
+            state=$(jq -r .state <<< "$snapshot")
+            mergeable=$(jq -r .mergeable <<< "$snapshot")
+            merge_state=$(jq -r .mergeStateStatus <<< "$snapshot")
+            review_decision=$(jq -r '.reviewDecision // ""' <<< "$snapshot")
+
+            # statusCheckRollup mixes check runs (conclusion) with commit statuses (state).
+            # The ignored workflows and contexts are dropped before either is read.
+            failed=$(jq -r --arg self "$SELF_WORKFLOW" --arg wf "$IGNORED_WORKFLOWS" --arg ck "$IGNORED_CHECKS" \
+              '[ .statusCheckRollup[]?
+              | select((.workflowName? // "") != $self)
+              | select(((.workflowName? // "") | IN($wf | split(",")[])) | not)
+              | select((((.name? // .context? // "")) | IN($ck | split(",")[])) | not)
+              | select(
+                  ((.conclusion? // "") | IN("FAILURE","CANCELLED","TIMED_OUT","STARTUP_FAILURE","ACTION_REQUIRED"))
+                  or ((.state? // "") | IN("FAILURE","ERROR"))
+                ) ] | length' <<< "$snapshot")
+
+            # Reported so that a "BLOCKED" state is readable in the log: a check that has
+            # not come back yet and a missing review both read as BLOCKED, and the two are
+            # told apart by whether anything is still pending.
+            pending=$(jq -r --arg self "$SELF_WORKFLOW" --arg wf "$IGNORED_WORKFLOWS" --arg ck "$IGNORED_CHECKS" \
+              '[ .statusCheckRollup[]?
+              | select((.workflowName? // "") != $self)
+              | select(((.workflowName? // "") | IN($wf | split(",")[])) | not)
+              | select((((.name? // .context? // "")) | IN($ck | split(",")[])) | not)
+              | select(
+                  ((.status? // "") | IN("QUEUED","IN_PROGRESS","WAITING","PENDING","REQUESTED"))
+                  or ((.state? // "") == "PENDING")
+                ) | (.name? // .context? // "check") ] | sort | join(",")' <<< "$snapshot")
+
+            echo "Attempt $attempt: state=$state mergeable=$mergeable mergeStateStatus=$merge_state review=$review_decision failing_checks=$failed pending_checks=[${pending}]"
+
+            if [ "$state" = "MERGED" ]; then
+              echo "✅ PR #$PR_NUMBER is already merged."
+              exit 0
+            fi
+
+            if [ "$state" = "CLOSED" ]; then
+              echo "::error::PR #$PR_NUMBER is closed."
+              exit 1
+            fi
+
+            if [ "$mergeable" = "CONFLICTING" ]; then
+              echo "::error::PR #$PR_NUMBER conflicts with $base_ref. Resolve the conflicts and merge it manually."
+              exit 1
+            fi
+
+            if [ "$failed" -gt 0 ]; then
+              echo "::error::PR #$PR_NUMBER has $failed failing check(s). Not merging it; investigate and merge it manually."
+              exit 1
+            fi
+
+            # Being behind does not clear on its own. This is the same "Update branch" a
+            # person clicks before merging these by hand; the merge commit it produces
+            # restarts the checks, which the loop then waits for as usual.
+            if [ "$merge_state" = "BEHIND" ]; then
+              if [ "$branch_updates" -ge "$MAX_BRANCH_UPDATES" ]; then
+                echo "::error::PR #$PR_NUMBER is still behind $base_ref after $branch_updates update(s). Update it and merge it manually."
+                exit 1
+              fi
+
+              branch_updates=$((branch_updates + 1))
+              echo "Attempt $attempt: behind $base_ref, updating the branch ($branch_updates/$MAX_BRANCH_UPDATES)."
+
+              if ! update=$(gh pr update-branch "$PR_NUMBER" --repo "$REPOSITORY" 2>&1); then
+                # A concurrent push, or a base that moved again mid-call, both read as a
+                # failure here and both clear on the next pass.
+                echo "Attempt $attempt: could not update the branch, retrying. Error: $update"
+              fi
+
+              sleep "$INTERVAL"
+              continue
+            fi
+
+            # Waited for here because the merge below will not wait for anything itself.
+            # Without this the job would merge at the first attempt with CodeRabbit and
+            # SonarCloud still running.
+            if [ -n "$pending" ]; then
+              echo "Attempt $attempt: waiting on [$pending], retrying in ${INTERVAL}s."
+              sleep "$INTERVAL"
+              continue
+            fi
+
+            # The approval that the merge below needs. It is this token's own review, on
+            # a pull request opened by a different account, so it counts the way any
+            # reviewer's would — this does not override the rule, it meets it. Only ever
+            # submitted once: a second one on the same pull request is refused.
+            if [ "$review_decision" != "APPROVED" ] && [ "$approved_here" -eq 0 ]; then
+              echo "Attempt $attempt: approving on the strength of the updater build."
+
+              if ! review=$(gh pr review "$PR_NUMBER" --repo "$REPOSITORY" --approve \
+                --body "Approving: the dependency updater built this and ran the integration test suites before opening the pull request, and no check on it is failing." 2>&1); then
+                echo "Attempt $attempt: could not approve, retrying. Error: $review"
+                sleep "$INTERVAL"
+                continue
+              fi
+
+              approved_here=1
+              # GitHub needs a moment to fold the review into the merge state.
+              sleep 10
+            fi
+
+            if [ "$mergeable" = "MERGEABLE" ] && gh pr merge "$PR_NUMBER" --repo "$REPOSITORY" --merge; then
+              echo "✅ Merged PR #$PR_NUMBER."
+              exit 0
+            fi
+
+            # Not merged yet. A merge state GitHub is still computing clears on its own.
+            echo "Attempt $attempt: not merged yet, retrying in ${INTERVAL}s."
+            sleep "$INTERVAL"
+          done
+
+          review_decision=$(gh pr view "$PR_NUMBER" --repo "$REPOSITORY" \
+            --json reviewDecision --jq .reviewDecision 2>/dev/null || echo "")
+
+          # Reaching here with the review still outstanding means the approval above did
+          # not count, and what grants that is the token's write permission on this
+          # repository. Check that before looking at the branch protection settings.
+          if [ "$review_decision" = "REVIEW_REQUIRED" ]; then
+            echo "::error::PR #$PR_NUMBER still requires an approving review. Check that IAM_CLOUD_BOT_TOKEN still has write on $REPOSITORY, then merge it manually."
+            exit 1
+          fi
+
+          echo "::error::Could not merge PR #$PR_NUMBER within $((ATTEMPTS * INTERVAL))s (last merge state: $merge_state). Merge it manually."
+          exit 1
