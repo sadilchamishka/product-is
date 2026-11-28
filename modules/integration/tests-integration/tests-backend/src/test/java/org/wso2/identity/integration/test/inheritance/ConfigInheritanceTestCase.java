@@ -458,6 +458,13 @@ public class ConfigInheritanceTestCase extends ISIntegrationTest {
         PropertyRevertReq propertyRevertReq = new PropertyRevertReq();
         List<String> properties = new ArrayList<>();
         properties.add(MULTI_ATTRIBUTE_ALLOWED_ATTRIBUTES_PROPERTY);
+        if (!isSubOrg) {
+            /*
+             * updateGovernanceConfig(false) also enables multi-attribute login in the root organization. Left
+             * enabled, every organization created by a later test inherits it, which breaks shared user login.
+             */
+            properties.add(MULTI_ATTRIBUTE_ENABLE_PROPERTY);
+        }
         propertyRevertReq.setProperties(properties);
 
         if (isSubOrg) {

@@ -60,6 +60,8 @@ import org.wso2.identity.integration.test.rest.api.server.application.management
 import org.wso2.identity.integration.test.rest.api.server.application.management.v1.model.InboundProtocols;
 import org.wso2.identity.integration.test.rest.api.server.application.management.v1.model.OpenIDConnectConfiguration;
 import org.wso2.identity.integration.test.rest.api.server.application.management.v1.model.SubjectTokenConfiguration;
+import org.wso2.identity.integration.test.rest.api.server.identity.governance.v1.dto.ConnectorsPatchReq;
+import org.wso2.identity.integration.test.rest.api.server.identity.governance.v1.dto.PropertyReq;
 import org.wso2.identity.integration.test.rest.api.server.roles.v2.model.Audience;
 import org.wso2.identity.integration.test.rest.api.server.roles.v2.model.Permission;
 import org.wso2.identity.integration.test.rest.api.server.roles.v2.model.RoleV2;
@@ -72,6 +74,7 @@ import org.wso2.identity.integration.test.rest.api.user.common.model.PatchOperat
 import org.wso2.identity.integration.test.rest.api.user.common.model.RoleItemAddGroupobj;
 import org.wso2.identity.integration.test.rest.api.user.common.model.ScimSchemaExtensionSystem;
 import org.wso2.identity.integration.test.rest.api.user.common.model.UserObject;
+import org.wso2.identity.integration.test.restclients.IdentityGovernanceRestClient;
 import org.wso2.identity.integration.test.restclients.OrgMgtRestClient;
 import org.wso2.identity.integration.test.restclients.SCIM2RestClient;
 import org.wso2.identity.integration.test.restclients.UserSharingRestClient;
@@ -125,6 +128,9 @@ public class Oauth2SharedUserImpersonationTestCase extends OAuth2ServiceAbstract
     private static final long POLL_INTERVAL_MS = 500L;
     private static final List<String> EXPECTED_AUTH_SEQUENCE =
             Arrays.asList(SHARED_USER_IDENTIFIER_EXECUTOR, BASIC_AUTHENTICATOR);
+    private static final String ACCOUNT_MGT_CATEGORY_ID = "QWNjb3VudCBNYW5hZ2VtZW50";
+    private static final String MULTI_ATTRIBUTE_CONNECTOR_ID = "bXVsdGlhdHRyaWJ1dGUubG9naW4uaGFuZGxlcg";
+    private static final String MULTI_ATTRIBUTE_ENABLE_PROPERTY = "account.multiattributelogin.handler.enable";
 
     private static final String ORG_IMPERSONATION_RESOURCE_IDENTIFIER = "org:impersonation";
     private static final String ORG_SCIM2_USER_RESOURCE_IDENTIFIER = "/o/scim2/Users";
@@ -154,6 +160,7 @@ public class Oauth2SharedUserImpersonationTestCase extends OAuth2ServiceAbstract
     private SCIM2RestClient scim2RestClient;
     private OrgMgtRestClient orgMgtRestClient;
     private UserSharingRestClient userSharingRestClient;
+    private IdentityGovernanceRestClient identityGovernanceRestClient;
     private CloseableHttpClient client;
     private CloseableHttpClient httpClientWithoutAutoRedirections;
     private final CookieStore cookieStore = new BasicCookieStore();
@@ -198,7 +205,9 @@ public class Oauth2SharedUserImpersonationTestCase extends OAuth2ServiceAbstract
         orgMgtRestClient = new OrgMgtRestClient(isServer, tenantInfo, serverURL,
                 new org.json.JSONObject(RESTTestBase.readResource("shared-user-impersonation-apis.json",
                         this.getClass())));
+        identityGovernanceRestClient = new IdentityGovernanceRestClient(serverURL, tenantInfo);
 
+        disableMultiAttributeLogin();
         createRootImpersonator();
         ApplicationResponseModel application = createImpersonationApplication();
         applicationId = application.getId();
@@ -244,6 +253,7 @@ public class Oauth2SharedUserImpersonationTestCase extends OAuth2ServiceAbstract
         scim2RestClient.closeHttpClient();
         orgMgtRestClient.closeHttpClient();
         userSharingRestClient.closeHttpClient();
+        identityGovernanceRestClient.closeHttpClient();
         httpClientWithoutAutoRedirections.close();
         restClient.closeHttpClient();
         client.close();
@@ -453,6 +463,27 @@ public class Oauth2SharedUserImpersonationTestCase extends OAuth2ServiceAbstract
                 authCodeRedirectionLocation.getValue(), OAuth2Constant.ID_TOKEN);
 
         EntityUtils.consume(authCodeResponse.getEntity());
+    }
+
+    /**
+     * Disable multi-attribute login in the root organization, which the sub-organization inherits.
+     * <p>
+     * With multi-attribute login enabled, BasicAuthenticator resolves the login identifier in the sub-organization,
+     * where it finds the shared user's sub-organization copy, and then authenticates that user ID against the root
+     * organization's user store, where it does not exist. The password step then fails with login.fail.message.
+     * Other test classes enable this setting in the root organization, so its state depends on which classes ran
+     * earlier in the same server.
+     */
+    private void disableMultiAttributeLogin() throws Exception {
+
+        PropertyReq enableProperty = new PropertyReq();
+        enableProperty.setName(MULTI_ATTRIBUTE_ENABLE_PROPERTY);
+        enableProperty.setValue("false");
+        ConnectorsPatchReq connectorPatchReq = new ConnectorsPatchReq();
+        connectorPatchReq.setOperation(ConnectorsPatchReq.OperationEnum.UPDATE);
+        connectorPatchReq.addProperties(enableProperty);
+        identityGovernanceRestClient.updateConnectors(ACCOUNT_MGT_CATEGORY_ID, MULTI_ATTRIBUTE_CONNECTOR_ID,
+                connectorPatchReq);
     }
 
     private ApplicationResponseModel createImpersonationApplication() throws Exception {
